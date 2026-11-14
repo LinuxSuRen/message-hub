@@ -39,12 +39,15 @@ type Config struct {
 
 // Server 聚合数据库、配置与全部处理器。
 type Server struct {
-	db       *gorm.DB
-	cfg      Config
-	sessions *auth.SessionManager
-	limiter  *tokenLimiter
-	hub      *sseHub
-	handler  http.Handler
+	db           *gorm.DB
+	cfg          Config
+	sessions     *auth.SessionManager
+	limiter      *tokenLimiter
+	loginLimiter *keyedLimiter
+	codeLimiter  *keyedLimiter
+	regLimiter   *keyedLimiter
+	hub          *sseHub
+	handler      http.Handler
 }
 
 // New 创建服务；webFS 为内嵌前端文件系统（根对应前端构建产物目录）。
@@ -53,11 +56,14 @@ func New(db *gorm.DB, cfg Config, webFS fs.FS) *Server {
 		panic("session secret 不能为空")
 	}
 	s := &Server{
-		db:       db,
-		cfg:      cfg,
-		sessions: auth.NewSessionManager(cfg.SessionSecret),
-		limiter:  newTokenLimiter(),
-		hub:      newSSEHub(),
+		db:           db,
+		cfg:          cfg,
+		sessions:     auth.NewSessionManager(cfg.SessionSecret),
+		limiter:      newTokenLimiter(),
+		loginLimiter: newKeyedLimiter(20, 10000, time.Hour),
+		codeLimiter:  newKeyedLimiter(5, 10000, time.Hour),
+		regLimiter:   newKeyedLimiter(10, 10000, time.Hour),
+		hub:          newSSEHub(),
 	}
 	mux := http.NewServeMux()
 	s.registerRoutes(mux, webFS)
@@ -71,9 +77,9 @@ func (s *Server) Handler() http.Handler { return s.handler }
 func (s *Server) registerRoutes(mux *http.ServeMux, webFS fs.FS) {
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
-	mux.HandleFunc("POST /api/v1/auth/verification-code", s.handleSendCode)
-	mux.HandleFunc("POST /api/v1/auth/register", s.handleRegister)
-	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/v1/auth/verification-code", limitByIP(s.codeLimiter, s.handleSendCode))
+	mux.HandleFunc("POST /api/v1/auth/register", limitByIP(s.regLimiter, s.handleRegister))
+	mux.HandleFunc("POST /api/v1/auth/login", limitByIP(s.loginLimiter, s.handleLogin))
 	mux.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/v1/auth/me", s.requireAuth(s.handleMe))
 	mux.HandleFunc("GET /api/v1/auth/oauth/{provider}/login", s.handleOAuthLogin)
@@ -111,47 +117,53 @@ type ctxKey int
 const (
 	ctxUserKey ctxKey = iota
 	ctxTokenKey
+	ctxTokenRateKey
 )
 
 var errUnauthorized = errors.New("unauthorized")
 
-// resolveAuth 解析 Bearer 令牌或会话 Cookie；返回用户与令牌 ID（会话登录时为 0）。
-func (s *Server) resolveAuth(r *http.Request) (*model.User, uint64, error) {
+// resolveAuth 解析 Bearer 令牌或会话 Cookie；返回用户、令牌 ID（会话登录时为 0）
+// 与该令牌的每分钟配额（会话登录时为 0）。
+func (s *Server) resolveAuth(r *http.Request) (*model.User, uint64, int, error) {
 	header := r.Header.Get("Authorization")
 	if tokenStr, ok := strings.CutPrefix(header, "Bearer "); ok && strings.HasPrefix(tokenStr, auth.TokenPrefix) {
 		var tk model.Token
 		if err := s.db.Where("token_hash = ? AND revoked_at IS NULL",
 			auth.HashToken(tokenStr)).First(&tk).Error; err != nil {
-			return nil, 0, errUnauthorized
+			return nil, 0, 0, errUnauthorized
 		}
 		var u model.User
 		if err := s.db.Preload("Tenant").First(&u, tk.UserID).Error; err != nil {
-			return nil, 0, errUnauthorized
+			return nil, 0, 0, errUnauthorized
 		}
 		now := time.Now()
 		if tk.LastUsedAt == nil || now.Sub(*tk.LastUsedAt) > time.Minute {
 			s.db.Model(&tk).Update("last_used_at", now)
 		}
-		return &u, tk.ID, nil
+		return &u, tk.ID, tk.RateLimitPerMin, nil
 	}
 	cookie, err := r.Cookie(auth.SessionCookie)
 	if err != nil || cookie.Value == "" {
-		return nil, 0, errUnauthorized
+		return nil, 0, 0, errUnauthorized
 	}
-	uid, ok := s.sessions.Verify(cookie.Value)
+	uid, epoch, ok := s.sessions.Verify(cookie.Value)
 	if !ok {
-		return nil, 0, errUnauthorized
+		return nil, 0, 0, errUnauthorized
 	}
 	var u model.User
 	if err := s.db.Preload("Tenant").First(&u, uid).Error; err != nil {
-		return nil, 0, errUnauthorized
+		return nil, 0, 0, errUnauthorized
 	}
-	return &u, 0, nil
+	// 世代号不匹配：密码已重置或安全事件后签发的旧会话，立即失效。
+	if u.SessionEpoch != epoch {
+		return nil, 0, 0, errUnauthorized
+	}
+	return &u, 0, 0, nil
 }
 
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u, tokenID, err := s.resolveAuth(r)
+		u, tokenID, ratePerMin, err := s.resolveAuth(r)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "未登录或凭证无效")
 			return
@@ -159,6 +171,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		ctx := context.WithValue(r.Context(), ctxUserKey, u)
 		if tokenID != 0 {
 			ctx = context.WithValue(ctx, ctxTokenKey, tokenID)
+			ctx = context.WithValue(ctx, ctxTokenRateKey, ratePerMin)
 		}
 		next(w, r.WithContext(ctx))
 	}
@@ -185,6 +198,12 @@ func (s *Server) currentUser(r *http.Request) *model.User {
 func (s *Server) currentTokenID(r *http.Request) uint64 {
 	id, _ := r.Context().Value(ctxTokenKey).(uint64)
 	return id
+}
+
+// currentTokenRate 返回本次请求所用令牌的每分钟配额（会话登录为 0）。
+func (s *Server) currentTokenRate(r *http.Request) int {
+	rate, _ := r.Context().Value(ctxTokenRateKey).(int)
+	return rate
 }
 
 // statusWriter 记录状态码；透传 Flush 以支持 SSE。

@@ -18,6 +18,9 @@ type OAuthUser struct {
 	Login string
 	Name  string
 	Email string
+	// EmailVerified 表示提供方已证实该邮箱归属该账号（如 GitHub /user/emails
+	// 的 verified 标记）。只有已证实的邮箱才允许自动绑定本地同邮箱账号。
+	EmailVerified bool
 }
 
 // OAuthProvider 抽象一个 OAuth2 提供方（授权码流程）。
@@ -91,6 +94,8 @@ func (p *GitHubProvider) FetchUser(ctx context.Context, accessToken string) (OAu
 	user.Login, _ = body["login"].(string)
 	user.Name, _ = body["name"].(string)
 	user.Email, _ = body["email"].(string)
+	// GitHub 公开资料中的邮箱只能从已验证地址中挑选，视为已证实。
+	user.EmailVerified = user.Email != ""
 	if user.Email == "" { // 私有邮箱时查 emails 接口
 		emails, err := getJSON(ctx, p.APIURL+"/user/emails", accessToken)
 		if err == nil {
@@ -102,6 +107,7 @@ func (p *GitHubProvider) FetchUser(ctx context.Context, accessToken string) (OAu
 						email, _ := m["email"].(string)
 						if primary && verified && email != "" {
 							user.Email = email
+							user.EmailVerified = true
 							break
 						}
 					}
@@ -178,6 +184,8 @@ func (p *GiteeProvider) FetchUser(ctx context.Context, accessToken string) (OAut
 	user.Login, _ = body["login"].(string)
 	user.Name, _ = body["name"].(string)
 	user.Email, _ = body["email"].(string)
+	// Gitee 的 /user 接口不返回邮箱验证状态，无法证实邮箱归属，
+	// 故 EmailVerified 保持 false：不允许自动绑定本地同邮箱账号。
 	if user.UID == "" {
 		return OAuthUser{}, fmt.Errorf("无法获取 Gitee 用户信息")
 	}

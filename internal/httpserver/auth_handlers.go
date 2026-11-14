@@ -72,14 +72,15 @@ func (s *Server) handleSendCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "生成验证码失败")
 		return
 	}
-	if s.cfg.Mailer != nil && s.cfg.Mailer.Configured() {
-		if err := s.cfg.Mailer.SendCode(email, code); err != nil {
-			log.Printf("发送验证码邮件失败 email=%s: %v", email, err)
-			writeError(w, http.StatusBadGateway, "验证码邮件发送失败，请稍后重试")
-			return
-		}
-	} else {
-		log.Printf("SMTP 未配置，验证码仅输出到日志：email=%s code=%s", email, code)
+	if s.cfg.Mailer == nil || !s.cfg.Mailer.Configured() {
+		// 未配置 SMTP 时拒绝发码：把验证码写日志等于向能读日志者开放任意邮箱注册。
+		writeError(w, http.StatusServiceUnavailable, "邮件服务未配置，无法发送验证码")
+		return
+	}
+	if err := s.cfg.Mailer.SendCode(email, code); err != nil {
+		log.Printf("发送验证码邮件失败 email=%s: %v", email, err)
+		writeError(w, http.StatusBadGateway, "验证码邮件发送失败，请稍后重试")
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -107,48 +108,71 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "当前未开放注册")
 		return
 	}
-	var userCount int64
-	if err := s.db.Model(&model.User{}).Count(&userCount).Error; err != nil {
-		writeError(w, http.StatusInternalServerError, "初始化数据异常")
-		return
-	}
-	var dup int64
-	s.db.Model(&model.User{}).Where("email = ?", email).Count(&dup)
-	if dup > 0 {
-		writeError(w, http.StatusConflict, "该邮箱已注册")
-		return
-	}
-	role := model.RoleUser
-	if userCount == 0 {
-		role = model.RoleAdmin // 引导：首个注册用户即平台管理员
-	} else if !auth.CheckVerificationCode(s.db, email, strings.TrimSpace(req.Code)) {
-		writeError(w, http.StatusForbidden, "验证码错误或已过期")
-		return
-	}
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "密码处理失败")
 		return
 	}
-	tenantID, err := store.DefaultTenantID(s.db)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "默认租户缺失")
+	// 事务内完成「计数 → 查重 → 验证码 → 建号」，
+	// 消除首个注册用户判定（首用户即平台管理员）的并发竞态。
+	var user model.User
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		var userCount int64
+		if err := tx.Model(&model.User{}).Count(&userCount).Error; err != nil {
+			return err
+		}
+		var dup int64
+		if err := tx.Model(&model.User{}).Where("email = ?", email).Count(&dup).Error; err != nil {
+			return err
+		}
+		if dup > 0 {
+			return errEmailExists
+		}
+		role := model.RoleUser
+		if userCount == 0 {
+			role = model.RoleAdmin // 引导：首个注册用户即平台管理员
+		} else if !auth.CheckVerificationCode(tx, email, strings.TrimSpace(req.Code)) {
+			return errBadCode
+		}
+		tenantID, err := store.DefaultTenantID(tx)
+		if err != nil {
+			return err
+		}
+		user = model.User{
+			TenantID: tenantID, Email: email, PasswordHash: hash,
+			DisplayName: emailDisplayName(email), Role: role,
+		}
+		if err := tx.Create(&user).Error; err != nil {
+			return err
+		}
+		var tenant model.Tenant
+		if err := tx.First(&tenant, tenantID).Error; err != nil {
+			return err
+		}
+		user.Tenant = &tenant
+		return nil
+	})
+	if errors.Is(err, errEmailExists) {
+		writeError(w, http.StatusConflict, "该邮箱已注册")
 		return
 	}
-	user := model.User{
-		TenantID: tenantID, Email: email, PasswordHash: hash,
-		DisplayName: emailDisplayName(email), Role: role,
+	if errors.Is(err, errBadCode) {
+		writeError(w, http.StatusForbidden, "验证码错误或已过期")
+		return
 	}
-	if err := s.db.Create(&user).Error; err != nil {
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "创建用户失败")
 		return
 	}
-	var tenant model.Tenant
-	s.db.First(&tenant, tenantID)
-	user.Tenant = &tenant
-	s.sessions.SetCookie(w, user.ID, s.cfg.SecureCookie)
+	s.sessions.SetCookie(w, user.ID, user.SessionEpoch, s.cfg.SecureCookie)
 	writeJSON(w, http.StatusCreated, toUserDTO(&user))
 }
+
+// errEmailExists / errBadCode 事务内错误标记，用于映射对外响应。
+var (
+	errEmailExists = errors.New("email exists")
+	errBadCode     = errors.New("bad verification code")
+)
 
 // handleLogin 邮箱密码登录。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +202,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "邮箱或密码错误")
 		return
 	}
-	s.sessions.SetCookie(w, user.ID, s.cfg.SecureCookie)
+	s.sessions.SetCookie(w, user.ID, user.SessionEpoch, s.cfg.SecureCookie)
 	writeJSON(w, http.StatusOK, toUserDTO(&user))
 }
 

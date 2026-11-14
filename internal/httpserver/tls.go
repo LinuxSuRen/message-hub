@@ -32,6 +32,11 @@ func SetupTLS(certPath, keyPath, clientCAPath string) (*tls.Config, error) {
 	if certPath == "" || keyPath == "" {
 		return nil, errors.New("-cert 与 -key 必须同时提供")
 	}
+	// 只存在一半时直接报错：静默自签覆盖会把运维失误（如路径写错）
+	// 变成证书被替换的更难排查的故障。
+	if fileExists(certPath) != fileExists(keyPath) {
+		return nil, fmt.Errorf("证书与私钥文件需成对存在（当前仅存在其一）：%s / %s", certPath, keyPath)
+	}
 	var cert tls.Certificate
 	var err error
 	if fileExists(certPath) && fileExists(keyPath) {

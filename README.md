@@ -13,7 +13,7 @@
 
 - **OAuth 登录**：GitHub、Gitee 授权登录（可配 API 地址适配企业版）
 - **多租户**：租户隔离的消息可见性，平台管理员 / 租户管理员 / 用户三级角色
-- **用户邮件自注册**：邮箱验证码（SMTP 可配，未配置时验证码输出到日志）
+- **用户邮件自注册**：邮箱验证码（SMTP 可配；未配置 SMTP 时发码接口返回 503，不再降级输出到日志）
 - **HTTPS 双向认证**：内置 TLS（证书缺失自动生成自签），`-client-ca` 一键开启 mTLS，**不依赖 Nginx**
 - **API 推送消息**：`POST /api/v1/messages` 令牌（Bearer）认证，**令牌级流量限制**（每分钟配额可配）
 - **移动端订阅**：SSE 实时推送本人租户与公开消息
@@ -92,7 +92,7 @@ curl -H "Authorization: Bearer mh_xxxxxxxx" \
 | `-base-url` | 自动推导 | 对外基础 URL（OAuth 回调、跳转） |
 | `-session-secret` | 自动生成并持久化 | 会话签名密钥 |
 | `-registration-open` | `true` | 是否开放邮箱自注册 |
-| `-smtp-host` `-smtp-port` `-smtp-username` `-smtp-password` `-smtp-from` | 空 | SMTP 邮件（验证码）；未配置时验证码输出到服务日志 |
+| `-smtp-host` `-smtp-port` `-smtp-username` `-smtp-password` `-smtp-from` | 空 | SMTP 邮件（验证码）；未配置时发码接口返回 503 |
 | `-oauth-github-client-id` `-oauth-github-client-secret` `-oauth-github-api` | 空 | GitHub OAuth（api 可覆盖适配企业版） |
 | `-oauth-gitee-client-id` `-oauth-gitee-client-secret` `-oauth-gitee-api` | 空 | Gitee OAuth |
 

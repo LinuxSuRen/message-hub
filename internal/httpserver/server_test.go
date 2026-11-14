@@ -720,3 +720,198 @@ func TestStaticWebServed(t *testing.T) {
 		t.Fatalf("首页应返回内嵌页面: %d %s", resp.StatusCode, body)
 	}
 }
+
+// ---- 安全修复回归测试 ----
+
+// TestAuthRateLimitPerIP 认证端点按 IP 限流：超过每分钟配额后应 429。
+func TestAuthRateLimitPerIP(t *testing.T) {
+	ts, _ := newTestServer(t)
+	client := newClient()
+	var sawLimited bool
+	for i := 0; i < 25; i++ {
+		status, _ := loginUser(t, ts, client, "nobody@ex.com", "wrong-password")
+		if status == http.StatusTooManyRequests {
+			sawLimited = true
+			break
+		}
+	}
+	if !sawLimited {
+		t.Fatal("连续失败登录应触发 IP 级限流 429")
+	}
+}
+
+// TestSendCodeWithoutSMTP 未配置 SMTP 时发码应 503，而不是把验证码写日志。
+func TestSendCodeWithoutSMTP(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, e := db.DB(); e == nil {
+			sqlDB.Close()
+		}
+	})
+	s := New(db, Config{
+		BaseURL: "http://hub.test", SessionSecret: []byte("unit-test-secret"),
+		RegistrationOpen: true, Version: "test",
+	}, fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newClient()
+	status, body := doJSON(t, client, http.MethodPost, ts.URL+"/api/v1/auth/verification-code",
+		map[string]string{"email": "someone@ex.com"}, nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("未配置 SMTP 应返回 503: %d %v", status, body)
+	}
+}
+
+// TestSessionInvalidatedOnPasswordReset 重置密码后：旧会话与 API 令牌立即失效。
+func TestSessionInvalidatedOnPasswordReset(t *testing.T) {
+	ts, mailer := newTestServer(t)
+	admin := newClient()
+	if status, _ := registerUser(t, ts, admin, "admin@ex.com", "password123"); status != http.StatusCreated {
+		t.Fatal("首用户注册失败")
+	}
+	// 注册第二个用户（验证码路径）
+	user := newClient()
+	status, _ := doJSON(t, user, http.MethodPost, ts.URL+"/api/v1/auth/verification-code",
+		map[string]string{"email": "user@ex.com"}, nil)
+	if status != http.StatusNoContent {
+		t.Fatalf("发送验证码失败: %d", status)
+	}
+	if status, _ = doJSON(t, user, http.MethodPost, ts.URL+"/api/v1/auth/register",
+		map[string]string{"email": "user@ex.com", "password": "password123", "code": mailer.code("user@ex.com")}, nil); status != http.StatusCreated {
+		t.Fatalf("第二用户注册失败: %d", status)
+	}
+	// 用户建令牌
+	token := createToken(t, ts, user, 60)
+	if status, _ := doJSON(t, user, http.MethodPost, ts.URL+"/api/v1/messages",
+		map[string]any{"title": "before"}, bearerAuth(token)); status != http.StatusCreated {
+		t.Fatal("重置前令牌推送应成功")
+	}
+	// 管理员重置该用户密码
+	status, _ = doJSON(t, admin, http.MethodPut, ts.URL+"/api/v1/users/2",
+		map[string]any{"password": "new-password-9"}, nil)
+	if status != http.StatusOK {
+		t.Fatalf("重置密码失败: %d", status)
+	}
+	// 操作者（管理员本人）的会话不受影响
+	if status, _ := doJSON(t, admin, http.MethodGet, ts.URL+"/api/v1/auth/me", nil, nil); status != http.StatusOK {
+		t.Fatalf("管理员自身会话应保持有效: %d", status)
+	}
+	// 旧会话失效
+	if status, _ := doJSON(t, user, http.MethodGet, ts.URL+"/api/v1/auth/me", nil, nil); status != http.StatusUnauthorized {
+		t.Fatalf("重置密码后旧会话应 401: %d", status)
+	}
+	// 旧令牌失效
+	if status, _ := doJSON(t, user, http.MethodPost, ts.URL+"/api/v1/messages",
+		map[string]any{"title": "after"}, bearerAuth(token)); status != http.StatusUnauthorized {
+		t.Fatalf("重置密码后旧令牌应 401: %d", status)
+	}
+	// 新密码可登录
+	if status, _ := loginUser(t, ts, newClient(), "user@ex.com", "new-password-9"); status != http.StatusOK {
+		t.Fatalf("新密码登录应成功: %d", status)
+	}
+	_ = mailer
+}
+
+// TestOAuthUnverifiedEmailNoBinding 提供方未证实邮箱时，不得绑定本地同邮箱账号。
+func TestOAuthUnverifiedEmailNoBinding(t *testing.T) {
+	// Gitee 风格：/user 返回 email 但无验证状态 → EmailVerified=false。
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"at-9"}`))
+		case "/user":
+			if r.Header.Get("Authorization") != "Bearer at-9" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":77,"login":"someone-else","name":"Attacker","email":"victim@ex.com"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	providers := map[string]auth.OAuthProvider{
+		"gitee": auth.NewGiteeProvider("cid", "csecret", fake.URL+"/authorize", fake.URL+"/token", fake.URL),
+	}
+	ts, db, _ := newTestServerWithProviders(t, providers)
+
+	// 受害者先以邮箱注册（首用户成为管理员）
+	victim := newClient()
+	if status, _ := registerUser(t, ts, victim, "victim@ex.com", "password123"); status != http.StatusCreated {
+		t.Fatal("受害者注册失败")
+	}
+
+	// 攻击者用未证实同邮箱的第三方身份登录
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}, Timeout: 10 * time.Second}
+	resp, err := client.Get(ts.URL + "/api/v1/auth/oauth/gitee/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	callback := ts.URL + "/api/v1/auth/oauth/gitee/callback?code=good-code&state=" + url.QueryEscape(loc.Query().Get("state"))
+	resp, err = client.Get(callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("回调应 302: %d", resp.StatusCode)
+	}
+
+	// 未证实邮箱不应绑定受害者账号，而应使用合成本地地址
+	me := &http.Client{Jar: jar, Timeout: 10 * time.Second}
+	status, body := doJSON(t, me, http.MethodGet, ts.URL+"/api/v1/auth/me", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("登录态异常: %d", status)
+	}
+	if email, _ := body["email"].(string); email == "victim@ex.com" {
+		t.Fatal("未证实邮箱不得绑定本地同邮箱账号")
+	}
+	var count int64
+	db.Table("users").Count(&count)
+	if count != 2 {
+		t.Fatalf("应为两个独立账号: %d", count)
+	}
+	// 受害者账号未受影响
+	if status, _ := loginUser(t, ts, newClient(), "victim@ex.com", "password123"); status != http.StatusOK {
+		t.Fatal("受害者原账号应不受影响")
+	}
+}
+
+// TestTokenCreationCap 每用户有效令牌数量上限。
+func TestTokenCreationCap(t *testing.T) {
+	ts, _ := newTestServer(t)
+	admin := newClient()
+	if status, _ := registerUser(t, ts, admin, "admin@ex.com", "password123"); status != http.StatusCreated {
+		t.Fatal("注册失败")
+	}
+	for i := 0; i < maxTokensPerUser; i++ {
+		_ = createToken(t, ts, admin, 60)
+	}
+	status, body := doJSON(t, admin, http.MethodPost, ts.URL+"/api/v1/tokens",
+		map[string]any{"name": "超额令牌"}, nil)
+	if status != http.StatusConflict {
+		t.Fatalf("第 %d 个令牌应被拒绝: %d %v", maxTokensPerUser+1, status, body)
+	}
+}
+
+// TestTLSHalfPairRejected 证书与私钥只存在一半时应报错而非静默自签覆盖。
+func TestTLSHalfPairRejected(t *testing.T) {
+	dir := t.TempDir()
+	certPath := dir + "/cert.pem"
+	if err := os.WriteFile(certPath, []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetupTLS(certPath, dir+"/missing-key.pem", ""); err == nil {
+		t.Fatal("证书与私钥不成对应报错")
+	}
+}

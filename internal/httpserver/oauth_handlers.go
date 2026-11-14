@@ -76,11 +76,13 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		email := normalizeEmail(ou.Email)
-		if email != "" { // 已注册邮箱直接绑定（第三方已验证邮箱所有权）
+		// 仅当提供方已证实邮箱归属（verified）时才自动绑定本地同邮箱账号；
+		// 否则不占用该邮箱，使用合成本地地址，防止未证实邮箱冒充他人账号。
+		if ou.EmailVerified && email != "" {
 			s.db.Preload("Tenant").Where("email = ?", email).First(&user)
 		}
 		if user.ID == 0 {
-			if !validEmail(email) {
+			if !ou.EmailVerified || !validEmail(email) {
 				email = fmt.Sprintf("%s-%s@oauth.message-hub.local", provider.Name(), ou.UID)
 			}
 			tenantID, err := store.DefaultTenantID(s.db)
@@ -110,7 +112,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			log.Printf("OAuth 绑定身份失败: %v", err)
 		}
 	}
-	s.sessions.SetCookie(w, user.ID, s.cfg.SecureCookie)
+	s.sessions.SetCookie(w, user.ID, user.SessionEpoch, s.cfg.SecureCookie)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 

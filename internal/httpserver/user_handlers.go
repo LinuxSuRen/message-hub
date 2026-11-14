@@ -3,6 +3,7 @@ package httpserver
 import (
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"gorm.io/gorm"
@@ -181,6 +182,20 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updates["password_hash"] = hash
+		if err := s.db.Model(&user).Updates(updates).Error; err != nil {
+			writeError(w, http.StatusInternalServerError, "更新用户失败")
+			return
+		}
+		// 密码被重置视为安全事件：旧会话与全部 API 令牌立即失效
+		//（无论操作者是本人还是管理员）。
+		s.revokeUserCredentials(user.ID)
+		s.db.Preload("Tenant").First(&user, id)
+		if current.ID == user.ID {
+			// 自己改自己的密码：当场重签会话，避免把操作者本人也踢下线。
+			s.sessions.SetCookie(w, user.ID, user.SessionEpoch, s.cfg.SecureCookie)
+		}
+		writeJSON(w, http.StatusOK, toUserDTO(&user))
+		return
 	}
 	if len(updates) == 0 {
 		writeError(w, http.StatusBadRequest, "没有需要更新的字段")
@@ -192,6 +207,17 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	s.db.Preload("Tenant").First(&user, id)
 	writeJSON(w, http.StatusOK, toUserDTO(&user))
+}
+
+// revokeUserCredentials 使某用户全部凭证失效（会话世代 +1、令牌吊销 + 限流器清理）。
+func (s *Server) revokeUserCredentials(userID uint64) {
+	var tokenIDs []uint64
+	s.db.Model(&model.Token{}).Where("user_id = ?", userID).Pluck("id", &tokenIDs)
+	s.db.Model(&model.Token{}).Where("user_id = ? AND revoked_at IS NULL", userID).
+		Update("revoked_at", time.Now())
+	s.db.Model(&model.User{}).Where("id = ?", userID).
+		Update("session_epoch", gorm.Expr("session_epoch + 1"))
+	s.limiter.removeAll(tokenIDs)
 }
 
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
@@ -215,12 +241,22 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "系统至少保留一名平台管理员")
 		return
 	}
-	if err := s.db.Delete(&user).Error; err != nil {
+	// 三连删（用户/身份/令牌）放入同一事务，避免中途失败留下孤儿行。
+	var tokenIDs []uint64
+	s.db.Model(&model.Token{}).Where("user_id = ?", id).Pluck("id", &tokenIDs)
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&user).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&model.OAuthIdentity{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("user_id = ?", id).Delete(&model.Token{}).Error
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "删除用户失败")
 		return
 	}
-	s.db.Where("user_id = ?", id).Delete(&model.OAuthIdentity{})
-	s.db.Where("user_id = ?", id).Delete(&model.Token{})
+	s.limiter.removeAll(tokenIDs)
 	w.WriteHeader(http.StatusNoContent)
 }
 

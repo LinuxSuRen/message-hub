@@ -38,6 +38,8 @@ type User struct {
 	PasswordHash string `gorm:"size:255" json:"-"` // OAuth 账号可能为空
 	DisplayName  string `gorm:"size:64" json:"display_name"`
 	Role         string `gorm:"size:32;index;not null;default:user" json:"role"`
+	// SessionEpoch 会话世代：重置密码等安全事件时 +1，使该用户全部已签发会话立即失效。
+	SessionEpoch uint64 `gorm:"not null;default:0" json:"-"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -82,8 +84,13 @@ type VerifyCode struct {
 	CodeHash  string `gorm:"size:64;not null" json:"-"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UsedAt    *time.Time `json:"-"`
+	// FailedAttempts 连续校验失败次数；达到 MaxCodeAttempts 后验证码立即作废（防穷举）。
+	FailedAttempts int `gorm:"not null;default:0" json:"-"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// MaxCodeAttempts 验证码最大连续失败次数。
+const MaxCodeAttempts = 5
 
 // TenantDTO 租户对外视图。
 type TenantDTO struct {

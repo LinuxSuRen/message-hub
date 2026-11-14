@@ -86,13 +86,11 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tokenID := s.currentTokenID(r); tokenID != 0 {
-		var tk model.Token
-		if err := s.db.First(&tk, tokenID).Error; err == nil {
-			if !s.limiter.allow(tokenID, tk.RateLimitPerMin) {
-				w.Header().Set("Retry-After", "1")
-				writeError(w, http.StatusTooManyRequests, "已触发流量限制，请降低推送频率")
-				return
-			}
+		// 配额来自 resolveAuth 已加载的令牌记录，避免二次查询的 fail-open 窗口。
+		if !s.limiter.allow(tokenID, s.currentTokenRate(r)) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusTooManyRequests, "已触发流量限制，请降低推送频率")
+			return
 		}
 	}
 	msg := model.Message{

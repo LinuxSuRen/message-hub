@@ -7,6 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/linuxsuren/message-hub/internal/model"
 	"github.com/linuxsuren/message-hub/internal/store"
 )
 
@@ -48,24 +49,30 @@ func TestTokenGenerateAndHash(t *testing.T) {
 
 func TestSessionIssueVerify(t *testing.T) {
 	m := NewSessionManager([]byte("unit-test-secret"))
-	value := m.Issue(42)
-	uid, ok := m.Verify(value)
+	value := m.Issue(42, 7)
+	uid, epoch, ok := m.Verify(value)
+	if !ok || uid != 42 || epoch != 7 {
+		t.Fatalf("应校验通过并得到用户 42/世代 7: ok=%v uid=%d epoch=%d", ok, uid, epoch)
+	}
+
+	// 世代号不匹配（模拟密码重置后的旧会话）
+	uid, _, ok = m.Verify(m.Issue(42, 8))
 	if !ok || uid != 42 {
-		t.Fatalf("应校验通过并得到用户 42: ok=%v uid=%d", ok, uid)
+		t.Fatalf("新世代会话应校验通过: ok=%v uid=%d", ok, uid)
 	}
 
 	// 篡改 payload
-	if _, ok := m.Verify("eyJpZCI6MX0." + strings.SplitN(value, ".", 2)[1]); ok {
+	if _, _, ok := m.Verify("eyJpZCI6MX0." + strings.SplitN(value, ".", 2)[1]); ok {
 		t.Fatal("篡改后的会话不应通过")
 	}
 	// 签名密钥不同
 	other := NewSessionManager([]byte("another-secret"))
-	if _, ok := other.Verify(value); ok {
+	if _, _, ok := other.Verify(value); ok {
 		t.Fatal("不同密钥签发的会话不应通过")
 	}
 	// 非法格式
 	for _, bad := range []string{"", "a.b.c.d", "####.ffff", "eHg.*bad*"} {
-		if _, ok := m.Verify(bad); ok {
+		if _, _, ok := m.Verify(bad); ok {
 			t.Fatalf("非法值不应通过: %q", bad)
 		}
 	}
@@ -127,4 +134,25 @@ func openTestDB(t *testing.T) *gorm.DB {
 		}
 	})
 	return db
+}
+
+// TestVerificationCodeMaxAttempts 连续错误达到上限后，正确验证码也必须被拒绝。
+func TestVerificationCodeMaxAttempts(t *testing.T) {
+	db := openTestDB(t)
+	code, err := IssueVerificationCode(db, "brute@ex.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < model.MaxCodeAttempts; i++ {
+		if CheckVerificationCode(db, "brute@ex.com", "000000") {
+			t.Fatalf("错误验证码不应通过（第 %d 次）", i+1)
+		}
+	}
+	if CheckVerificationCode(db, "brute@ex.com", code) {
+		t.Fatal("达到失败上限后，正确验证码也应被拒绝")
+	}
+	// 60 秒频控内不允许重新签发（防「重发重试」绕过失败上限）
+	if _, err := IssueVerificationCode(db, "brute@ex.com"); err != ErrCodeTooFrequent {
+		t.Fatalf("频控期内重新签发应被拒绝: %v", err)
+	}
 }

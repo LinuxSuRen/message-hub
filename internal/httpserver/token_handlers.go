@@ -26,6 +26,10 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items)
 }
 
+// maxTokensPerUser 每用户有效令牌上限：限流按令牌隔离，
+// 不设上限则 N 个令牌 = N 倍配额，令牌级限流作为滥用控制即失效。
+const maxTokensPerUser = 10
+
 // handleCreateToken 创建令牌；明文仅本次响应返回。
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -48,6 +52,17 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RateLimitPerMin < 1 || req.RateLimitPerMin > 100000 {
 		writeError(w, http.StatusBadRequest, "每分钟上限取值 1 ~ 100000")
+		return
+	}
+	var active int64
+	if err := s.db.Model(&model.Token{}).
+		Where("user_id = ? AND revoked_at IS NULL", s.currentUser(r).ID).
+		Count(&active).Error; err != nil {
+		writeError(w, http.StatusInternalServerError, "查询令牌失败")
+		return
+	}
+	if active >= maxTokensPerUser {
+		writeError(w, http.StatusConflict, "有效令牌数量已达上限，请先吊销不再使用的令牌")
 		return
 	}
 	plain, err := auth.GenerateToken()
