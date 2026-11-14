@@ -15,7 +15,7 @@ jobs:
     name: 二进制 Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # goreleaser changelog 需要完整历史
 
@@ -45,7 +45,7 @@ jobs:
     name: 容器镜像 GHCR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # GHCR 要求全小写；LinuxSuRen 这类大写 owner 需转换
       - name: 计算小写镜像名
