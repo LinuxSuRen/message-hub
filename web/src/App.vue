@@ -25,12 +25,14 @@
       <el-aside width="180px" class="app-aside">
         <el-menu :default-active="view" @select="(v) => (view = v)">
           <el-menu-item index="messages">消息中心</el-menu-item>
+          <el-menu-item index="sources">消息源</el-menu-item>
           <el-menu-item index="tokens">推送令牌</el-menu-item>
           <el-menu-item v-if="user.role !== 'user'" index="admin">管理</el-menu-item>
         </el-menu>
       </el-aside>
       <el-main>
-        <Messages v-if="view === 'messages'" />
+        <Messages v-if="view === 'messages'" :user="user" />
+        <Sources v-else-if="view === 'sources'" />
         <Tokens v-else-if="view === 'tokens'" />
         <Admin v-else :user="user" />
       </el-main>
@@ -45,6 +47,7 @@ import { ElMessage } from 'element-plus'
 import { api, roleText } from './api'
 import Login from './views/Login.vue'
 import Messages from './views/Messages.vue'
+import Sources from './views/Sources.vue'
 import Tokens from './views/Tokens.vue'
 import Admin from './views/Admin.vue'
 

@@ -131,7 +131,13 @@ func run(opts runOptions) error {
 		RegistrationOpen: opts.registrationOpen,
 		SecureCookie:     tlsConfig != nil,
 		Version:          version.Version,
+		GitHubAPI:        opts.githubAPI,
 	}, webFS)
+
+	// 消息源 star/fork 轮询：随服务启停
+	pollCtx, stopPolling := context.WithCancel(context.Background())
+	defer stopPolling()
+	srv.StartPolling(pollCtx)
 
 	server := &http.Server{
 		Addr:              opts.addr,
