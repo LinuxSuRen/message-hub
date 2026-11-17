@@ -36,6 +36,8 @@ func Open(dataDir string) (*gorm.DB, error) {
 	if err := db.AutoMigrate(
 		&model.Tenant{}, &model.User{}, &model.OAuthIdentity{},
 		&model.Token{}, &model.Message{}, &model.VerifyCode{},
+		&model.Source{}, &model.SourceSub{}, &model.SourceItem{},
+		&model.Setting{},
 	); err != nil {
 		return nil, err
 	}

@@ -16,7 +16,13 @@
 - **用户邮件自注册**：邮箱验证码（SMTP 可配；未配置 SMTP 时发码接口返回 503，不再降级输出到日志）
 - **HTTPS 双向认证**：内置 TLS（证书缺失自动生成自签），`-client-ca` 一键开启 mTLS，**不依赖 Nginx**
 - **API 推送消息**：`POST /api/v1/messages` 令牌（Bearer）认证，**令牌级流量限制**（每分钟配额可配）
-- **移动端订阅**：SSE 实时推送本人租户与公开消息
+- **GitHub 消息源**：自动获取知名平台信息并**转存**到本站，其他客户端订阅即可获取
+  - 建源时填一次 GitHub 令牌，hub 校验后加密存储；令牌可随时在编辑中更换
+  - Release / Issue / PR 通过 webhook 实时接收——**是否同步 webhook 由用户决定**（需要对外地址），不开也不影响建源与 star / fork 轮询
+  - star / fork 数量增减由 hub 定时轮询（间隔可配），变化才产生消息
+  - 对外地址可在管理台「管理 → 系统设置」中配置（优先于 `-base-url` 启动参数）
+  - 按用户订阅分发：谁订阅谁收到（SSE 实时 + 历史查询），跨租户可用；事件级去重防重投
+- **移动端订阅**：SSE 实时推送本人租户、公开与已订阅消息源的消息
   - 安卓客户端：[LinuxSuRen/message-android](https://github.com/LinuxSuRen/message-android)
   - 鸿蒙客户端：[LinuxSuRen/message-harmony](https://github.com/LinuxSuRen/message-harmony)
 - **单二进制启动、容器启动**
@@ -63,6 +69,15 @@ curl -H "Authorization: Bearer mh_xxxxxxxx" \
 ```
 
 4. Web 管理台或移动端 App 登录后即可实时收到本人租户与公开消息
+5. 也可以在 Web 管理台「消息中心」直接**发布消息**（登录即可，发到本租户；公开消息需管理员角色）
+
+### GitHub 消息源
+
+1. 管理台 →「消息源」→ 新建：填 `owner/repo` 与 GitHub 令牌（需要仓库读取 + webhook 管理权限，如 `repo` + `admin:repo_hooks`），勾选关注内容
+2. hub 校验令牌后自动在仓库上注册 webhook（每源独立密钥验签），并立即转存最新 Release 作为首条消息
+3. 任何登录用户可在「消息源」页订阅 / 退订；已订阅用户通过 SSE 实时收到动态，历史消息随时查询，主题为 `github/{owner}/{repo}`
+
+注意：webhook 要求 GitHub 能访问本服务，请用 `-base-url` 配置公网地址；star / fork 数监控不需要公网可达。
 
 ### 多租户与角色
 
@@ -112,8 +127,14 @@ curl -H "Authorization: Bearer mh_xxxxxxxx" \
 | GET | `/api/v1/auth/oauth/{provider}/login` | OAuth 登录跳转（github / gitee） |
 | GET | `/api/v1/auth/oauth/{provider}/callback` | OAuth 回调 |
 | POST | `/api/v1/messages` | 推送消息（令牌认证，按令牌限流）`{"title","body","topic","level","public"}` |
-| GET | `/api/v1/messages?limit=&cursor=&scope=all\|own\|public` | 查询消息（本人租户 + 公开；id 降序，游标翻页） |
+| GET | `/api/v1/messages` | 查询消息（本人租户 + 公开 + 已订阅源；id 降序）。翻页两模式：页码 `?page=1&page_size=50` → `{items,page,page_size,total}`，游标 `?limit=&cursor=` → `{items,next_cursor}`（移动端）。查询条件（两模式通用）：`scope=all\|own\|public`、`topic=`、`q=`（标题/正文关键字）、`level=` |
 | GET | `/api/v1/stream` | SSE 实时订阅：`event: message` 推消息、`event: heartbeat` 保活（约 20s） |
+| GET/POST | `/api/v1/sources` | 消息源列表 / 创建（`{"owner","repo","token","watch_release","watch_issues","watch_pulls","watch_stars","watch_forks","use_webhook","interval_sec"}`；token 仅创建时提交并加密存储；`use_webhook` 默认关，开启才注册 webhook） |
+| PUT/DELETE | `/api/v1/sources/{id}` | 更新关注内容 / 启停 / 轮询间隔 / 更换 GitHub 令牌（`{"token"}` 非空时先验证再加密落库） / 开关 webhook 同步；删除时清理 webhook（创建者或平台管理员；owner/repo 为身份字段不可改，换仓库请删除重建） |
+| POST/DELETE | `/api/v1/sources/{id}/subscription` | 订阅 / 退订（任何登录用户） |
+| POST | `/api/v1/webhooks/github` | GitHub webhook 回调（HMAC-SHA256 验签，无需登录） |
+| GET | `/api/v1/settings` | 系统设置（登录可读）：对外地址及是否已配置 |
+| PUT | `/api/v1/settings` | 更新对外地址 `{"base_url"}`（平台管理员；空串清除，回落 `-base-url`） |
 | GET/POST | `/api/v1/tokens` | 令牌列表 / 创建（明文仅创建时返回） |
 | DELETE | `/api/v1/tokens/{id}` | 吊销令牌 |
 | GET/POST/PUT/DELETE | `/api/v1/tenants` | 租户管理（平台管理员） |
@@ -138,6 +159,7 @@ data: {"id":1,"tenant_id":1,"topic":"ci","title":"构建失败","body":"pipeline
 ## 安全模型
 
 - 密码 bcrypt 哈希存储；推送令牌与验证码只存 SHA-256 哈希，令牌明文仅创建时返回一次
+- 消息源的 GitHub 令牌与 webhook 验签密钥以 AES-GCM 加密落库（密钥随会话密钥派生）；webhook 回调逐条验签（常数时间比较），重复投递按事件 ID 去重
 - 会话为 HMAC-SHA256 签名的无状态 Cookie（HttpOnly / SameSite=Lax / HTTPS 下 Secure）
 - 租户隔离在查询层强制：任何人无法读取其他租户的私有消息；公开消息仅管理员角色可发
 - mTLS 场景下没有客户端证书的连接在 TLS 握手阶段即被拒绝

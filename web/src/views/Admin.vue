@@ -10,6 +10,7 @@
     <el-tabs v-model="tab" @tab-change="loadCurrent">
       <el-tab-pane v-if="isAdmin" label="租户管理" name="tenants" />
       <el-tab-pane label="用户管理" name="users" />
+      <el-tab-pane v-if="isAdmin" label="系统设置" name="settings" />
     </el-tabs>
 
     <template v-if="tab === 'tenants' && isAdmin">
@@ -30,6 +31,22 @@
           </template>
         </el-table-column>
       </el-table>
+    </template>
+
+    <template v-else-if="tab === 'settings' && isAdmin">
+      <el-card shadow="never" class="settings-card">
+        <template #header>对外地址</template>
+        <el-form label-width="90px">
+          <el-form-item label="地址">
+            <el-input v-model="settingsForm.base_url" placeholder="https://msg.example.com（留空使用启动参数）" />
+          </el-form-item>
+        </el-form>
+        <p class="settings-hint">
+          GitHub webhook 回调使用此地址，需要能被公网访问；仅关注 star / fork 数变化时无需配置。
+          当前生效地址：{{ effectiveBaseURL || '—' }}
+        </p>
+        <el-button type="primary" :loading="saving" @click="saveSettings">保存设置</el-button>
+      </el-card>
     </template>
 
     <template v-else>
@@ -114,7 +131,6 @@ import { api, fmtTime, roleText } from '../api'
 
 const props = defineProps({ user: { type: Object, required: true } })
 const isAdmin = computed(() => props.user?.role === 'admin')
-
 const tab = ref('tenants')
 const loading = ref(false)
 const saving = ref(false)
@@ -127,8 +143,36 @@ const userVisible = ref(false)
 const tenantForm = reactive({ id: 0, name: '' })
 const userForm = reactive({ id: 0, email: '', display_name: '', role: 'user', tenant_id: null, password: '' })
 
+// 系统设置：对外地址（webhook 回调）
+const settingsForm = reactive({ base_url: '' })
+const effectiveBaseURL = ref('')
+
+async function loadSettings() {
+  try {
+    const data = await api.get('/api/v1/settings')
+    settingsForm.base_url = data.base_url_configured ? data.base_url : ''
+    effectiveBaseURL.value = data.base_url || ''
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function saveSettings() {
+  saving.value = true
+  try {
+    const data = await api.put('/api/v1/settings', { base_url: settingsForm.base_url })
+    ElMessage.success('设置已保存')
+    effectiveBaseURL.value = data.base_url || ''
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    saving.value = false
+  }
+}
+
 function loadCurrent() {
   if (tab.value === 'tenants') loadTenants()
+  else if (tab.value === 'settings') loadSettings()
   else loadUsers()
 }
 
@@ -283,6 +327,15 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.settings-card {
+  max-width: 640px;
+}
+.settings-hint {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0 0 12px;
+}
 .stats {
   display: flex;
   gap: 12px;

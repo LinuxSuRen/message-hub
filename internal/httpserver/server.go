@@ -18,6 +18,7 @@ import (
 
 	"github.com/linuxsuren/message-hub/internal/auth"
 	"github.com/linuxsuren/message-hub/internal/model"
+	"github.com/linuxsuren/message-hub/internal/source"
 )
 
 // codeSender 抽象验证码邮件发送；生产环境注入 *auth.Mailer，测试可注入捕获器。
@@ -28,13 +29,14 @@ type codeSender interface {
 
 // Config 服务端配置。
 type Config struct {
-	BaseURL          string // 对外基础 URL，用于 OAuth 回调
-	SessionSecret    []byte // 会话签名密钥
+	BaseURL          string // 对外基础 URL，用于 OAuth 回调与 webhook 注册
+	SessionSecret    []byte // 会话签名密钥（兼作消息源凭证加密主密钥）
 	Providers        map[string]auth.OAuthProvider
 	Mailer           codeSender
 	RegistrationOpen bool
 	SecureCookie     bool // HTTPS 下置 true
 	Version          string
+	GitHubAPI        string // GitHub API 覆盖地址（GitHub Enterprise 用）
 }
 
 // Server 聚合数据库、配置与全部处理器。
@@ -46,7 +48,9 @@ type Server struct {
 	loginLimiter *keyedLimiter
 	codeLimiter  *keyedLimiter
 	regLimiter   *keyedLimiter
+	hookLimiter  *keyedLimiter
 	hub          *sseHub
+	sources      *source.Service
 	handler      http.Handler
 }
 
@@ -63,8 +67,10 @@ func New(db *gorm.DB, cfg Config, webFS fs.FS) *Server {
 		loginLimiter: newKeyedLimiter(20, 10000, time.Hour),
 		codeLimiter:  newKeyedLimiter(5, 10000, time.Hour),
 		regLimiter:   newKeyedLimiter(10, 10000, time.Hour),
+		hookLimiter:  newKeyedLimiter(120, 10000, time.Hour),
 		hub:          newSSEHub(),
 	}
+	s.sources = source.NewService(db, cfg.SessionSecret, cfg.GitHubAPI, s.publishMessage)
 	mux := http.NewServeMux()
 	s.registerRoutes(mux, webFS)
 	s.handler = s.withRecovery(s.withLogging(mux))
@@ -93,6 +99,17 @@ func (s *Server) registerRoutes(mux *http.ServeMux, webFS fs.FS) {
 	mux.HandleFunc("POST /api/v1/tokens", s.requireAuth(s.handleCreateToken))
 	mux.HandleFunc("DELETE /api/v1/tokens/{id}", s.requireAuth(s.handleDeleteToken))
 
+	mux.HandleFunc("GET /api/v1/sources", s.requireAuth(s.handleListSources))
+	mux.HandleFunc("POST /api/v1/sources", s.requireAuth(s.handleCreateSource))
+	mux.HandleFunc("PUT /api/v1/sources/{id}", s.requireAuth(s.handleUpdateSource))
+	mux.HandleFunc("DELETE /api/v1/sources/{id}", s.requireAuth(s.handleDeleteSource))
+	mux.HandleFunc("POST /api/v1/sources/{id}/subscription", s.requireAuth(s.handleSubscribeSource))
+	mux.HandleFunc("DELETE /api/v1/sources/{id}/subscription", s.requireAuth(s.handleUnsubscribeSource))
+	mux.HandleFunc("POST /api/v1/webhooks/github", limitByIP(s.hookLimiter, s.handleGitHubWebhook))
+
+	mux.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleGetSettings))
+	mux.HandleFunc("PUT /api/v1/settings", s.requireAuth(s.requireRole(s.handleUpdateSettings, model.RoleAdmin)))
+
 	mux.HandleFunc("GET /api/v1/tenants", s.requireAuth(s.requireRole(s.handleListTenants, model.RoleAdmin)))
 	mux.HandleFunc("POST /api/v1/tenants", s.requireAuth(s.requireRole(s.handleCreateTenant, model.RoleAdmin)))
 	mux.HandleFunc("PUT /api/v1/tenants/{id}", s.requireAuth(s.requireRole(s.handleUpdateTenant, model.RoleAdmin)))
@@ -108,6 +125,33 @@ func (s *Server) registerRoutes(mux *http.ServeMux, webFS fs.FS) {
 	if webFS != nil {
 		mux.Handle("GET /", http.FileServerFS(webFS))
 	}
+}
+
+// publishMessage 统一的消息分发入口：
+// 消息源消息（SourceID 非零）只推给订阅该源的用户；其余按租户/公开规则分发。
+func (s *Server) publishMessage(msg *model.Message) {
+	if msg.SourceID == 0 {
+		s.hub.publish(msg, nil)
+		return
+	}
+	var subs []model.SourceSub
+	if err := s.db.Where("source_id = ?", msg.SourceID).Find(&subs).Error; err != nil {
+		log.Printf("查询消息源订阅者失败: %v", err)
+		return
+	}
+	if len(subs) == 0 {
+		return
+	}
+	users := make([]uint64, 0, len(subs))
+	for _, sub := range subs {
+		users = append(users, sub.UserID)
+	}
+	s.hub.publish(msg, users)
+}
+
+// StartPolling 启动消息源 star/fork 轮询协程；ctx 取消后停止。
+func (s *Server) StartPolling(ctx context.Context) {
+	go s.sources.PollLoop(ctx)
 }
 
 // ---- 中间件 ----
